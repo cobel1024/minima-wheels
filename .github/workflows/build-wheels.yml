@@ -76,7 +76,7 @@ jobs:
               -v ${{ github.workspace }}/wheels:/wheels \
               quay.io/pypa/musllinux_1_2_${{ matrix.arch }} \
               sh -c "
-                /opt/python/cp314-cp314/bin/pip wheel --no-deps --wheel-dir /wheels '$SPEC' && \
+                NUM_AVAILABLE_CPU_CORES=2 /opt/python/cp314-cp314/bin/pip wheel --no-deps --wheel-dir /wheels '$SPEC' && \
                 find /wheels -name '*.so*' -exec strip --strip-all {} \; 2>/dev/null || true
               "
           done
