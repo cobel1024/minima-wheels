@@ -1,0 +1,190 @@
+name: Build Wheels
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  check-versions:
+    runs-on: ubuntu-latest
+    outputs:
+      packages: ${{ steps.check.outputs.packages }}
+      has_builds: ${{ steps.check.outputs.has_builds }}
+    steps:
+      - name: Check PyPI versions against release
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PACKAGES='[{"name":"kiwipiepy","spec":"kiwipiepy","musllinux":true},{"name":"ua_parser","spec":"ua-parser[regex]","musllinux":false}]'
+
+          VERSIONS_JSON=$(gh release download latest-wheels \
+            --repo ${{ github.repository }} \
+            --pattern versions.json \
+            --output - 2>/dev/null || echo '{}')
+
+          TO_BUILD='[]'
+          for row in $(echo "$PACKAGES" | jq -c '.[]'); do
+            NAME=$(echo "$row" | jq -r '.name')
+            SPEC=$(echo "$row" | jq -r '.spec')
+            MUSLLINUX=$(echo "$row" | jq -r '.musllinux')
+
+            PYPI_VERSION=$(curl -sf "https://pypi.org/pypi/${NAME}/json" | jq -r '.info.version')
+            CURRENT=$(echo "$VERSIONS_JSON" | jq -r --arg n "$NAME" '.[$n] // ""')
+
+            echo "$NAME: PyPI=$PYPI_VERSION current=$CURRENT"
+
+            if [ "$PYPI_VERSION" != "$CURRENT" ]; then
+              echo "  -> rebuild"
+              TO_BUILD=$(echo "$TO_BUILD" | jq -c \
+                --arg spec "$SPEC" \
+                --arg name "$NAME" \
+                --argjson musllinux "$MUSLLINUX" \
+                '. + [{"spec":$spec,"name":$name,"musllinux":$musllinux}]')
+            else
+              echo "  -> up to date"
+            fi
+          done
+
+          echo "packages=$TO_BUILD" >> $GITHUB_OUTPUT
+          if [ "$(echo "$TO_BUILD" | jq 'length')" -gt 0 ]; then
+            echo "has_builds=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_builds=false" >> $GITHUB_OUTPUT
+          fi
+
+  build-musllinux:
+    needs: check-versions
+    if: needs.check-versions.outputs.has_builds == 'true'
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Build musllinux wheels
+        run: |
+          mkdir -p wheels
+          PACKAGES='${{ needs.check-versions.outputs.packages }}'
+          for row in $(echo "$PACKAGES" | jq -c '.[] | select(.musllinux == true)'); do
+            SPEC=$(echo "$row" | jq -r '.spec')
+            docker run --rm \
+              -v ${{ github.workspace }}/wheels:/wheels \
+              quay.io/pypa/musllinux_1_2_${{ matrix.arch }} \
+              sh -c "
+                /opt/python/cp314-cp314/bin/pip wheel --no-deps --wheel-dir /wheels '$SPEC' && \
+                find /wheels -name '*.so*' -exec strip --strip-all {} \; 2>/dev/null || true
+              "
+          done
+
+      - name: Upload musllinux wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-musllinux-${{ matrix.arch }}
+          path: wheels/*.whl
+          if-no-files-found: ignore
+          retention-days: 1
+
+  build-pure:
+    needs: check-versions
+    if: needs.check-versions.outputs.has_builds == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build pure python wheels
+        run: |
+          mkdir -p wheels
+          PACKAGES='${{ needs.check-versions.outputs.packages }}'
+          for row in $(echo "$PACKAGES" | jq -c '.[] | select(.musllinux == false)'); do
+            SPEC=$(echo "$row" | jq -r '.spec')
+            pip wheel --no-deps --wheel-dir wheels "$SPEC"
+          done
+
+      - name: Upload pure wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-pure
+          path: wheels/*.whl
+          if-no-files-found: ignore
+          retention-days: 1
+
+  release:
+    needs: [check-versions, build-musllinux, build-pure]
+    if: needs.check-versions.outputs.has_builds == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: wheels/
+
+      - name: Fetch existing versions.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download latest-wheels \
+            --repo ${{ github.repository }} \
+            --pattern versions.json \
+            --output versions.json 2>/dev/null || echo '{}' > versions.json
+
+      - name: Update versions.json and rename wheels
+        run: |
+          for wheel in wheels/*.whl; do
+            BASENAME=$(basename "$wheel")
+            PKG_NAME=$(echo "$BASENAME" | cut -d'-' -f1 | tr '[:upper:]' '[:lower:]')
+            VERSION=$(echo "$BASENAME" | cut -d'-' -f2)
+
+            versions_json=$(jq --arg k "$PKG_NAME" --arg v "$VERSION" '.[$k] = $v' versions.json)
+            echo "$versions_json" > versions.json
+
+            NEW_NAME=$(echo "$BASENAME" | sed 's/-[0-9][^-]*-\(py3\|cp\)/-0-\1/')
+            [ "$BASENAME" != "$NEW_NAME" ] && mv "$wheel" "wheels/$NEW_NAME"
+          done
+          echo "versions.json:"
+          cat versions.json
+
+      - name: Ensure release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view latest-wheels --repo ${{ github.repository }} > /dev/null 2>&1 || \
+            gh release create latest-wheels \
+              --repo ${{ github.repository }} \
+              --title "Latest Wheels" \
+              --notes "Auto-built wheels"
+
+      - name: Delete stale assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PACKAGES='${{ needs.check-versions.outputs.packages }}'
+          EXISTING=$(gh release view latest-wheels \
+            --repo ${{ github.repository }} \
+            --json assets --jq '[.assets[].name]')
+
+          for row in $(echo "$PACKAGES" | jq -c '.[]'); do
+            NAME=$(echo "$row" | jq -r '.name')
+            for asset in $(echo "$EXISTING" | jq -r --arg n "$NAME" '.[] | select(ascii_downcase | startswith($n))'); do
+              echo "Deleting $asset"
+              gh release delete-asset latest-wheels "$asset" \
+                --repo ${{ github.repository }} --yes 2>/dev/null || true
+            done
+          done
+
+          gh release delete-asset latest-wheels versions.json \
+            --repo ${{ github.repository }} --yes 2>/dev/null || true
+
+      - name: Upload new assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload latest-wheels \
+            --repo ${{ github.repository }} \
+            wheels/*.whl versions.json
