@@ -58,6 +58,7 @@ jobs:
     needs: check-versions
     if: needs.check-versions.outputs.has_builds == 'true'
     strategy:
+      fail-fast: false
       matrix:
         include:
           - arch: x86_64
@@ -74,6 +75,10 @@ jobs:
             SPEC=$(echo "$row" | jq -r '.spec')
             docker run --rm \
               -v ${{ github.workspace }}/wheels:/wheels \
+              -e NUM_AVAILABLE_CPU_CORES=2 \
+              -e MAKEFLAGS=-j2 \
+              -e CMAKE_BUILD_PARALLEL_LEVEL=2 \
+              -e MAX_JOBS=2 \
               quay.io/pypa/musllinux_1_2_${{ matrix.arch }} \
               sh -c "
                 /opt/python/cp314-cp314/bin/pip wheel --no-deps --wheel-dir /wheels '$SPEC' && \
